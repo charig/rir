@@ -131,18 +131,6 @@ static RIR_INLINE SEXP getSrcForCall(Code* c, Opcode* pc,
 
 static RCNTXT* deoptimizationStartedAt = nullptr;
 
-static bool isDeoptimizing() {
-    if (!deoptimizationStartedAt)
-        return false;
-    RCNTXT* cur = R_GlobalContext;
-    while (cur) {
-        if (cur == deoptimizationStartedAt)
-            return true;
-        cur = cur->nextcontext;
-    }
-    deoptimizationStartedAt = nullptr;
-    return false;
-}
 static void startDeoptimizing() { deoptimizationStartedAt = R_GlobalContext; }
 static void endDeoptimizing() { deoptimizationStartedAt = nullptr; }
 
@@ -802,47 +790,8 @@ RIR_INLINE SEXP rirCall(CallContext& call, InterpreterInstance* ctx) {
 
     auto table = DispatchTable::unpack(body);
 
-    addDynamicAssumptionsFromContext(call);
-    Function* fun = dispatch(call, table);
+    Function* fun = table->baseline();
     fun->registerInvocation();
-
-    if (!isDeoptimizing() && !fun->unoptimizable &&
-        fun->deoptCount() < pir::Parameter::DEOPT_ABANDON &&
-        ((fun != table->baseline() && fun->invocationCount() >= 2 &&
-          fun->invocationCount() <= pir::Parameter::RIR_WARMUP) ||
-         (fun->invocationCount() %
-          (fun->deoptCount() + pir::Parameter::RIR_WARMUP)) == 0)) {
-        Assumptions given =
-            addDynamicAssumptionsForOneTarget(call, fun->signature());
-        // addDynamicAssumptionForOneTarget compares arguments with the
-        // signature of the current dispatch target. There the number of
-        // arguments might be off. But we want to force compiling a new version
-        // exactly for this number of arguments, thus we need to add this as an
-        // explicit assumption.
-        if (fun == table->baseline() || given != fun->signature().assumptions) {
-            if (Assumptions(given).includes(
-                    pir::Rir2PirCompiler::minimalAssumptions)) {
-                // More assumptions are available than this version uses. Let's
-                // try compile a better matching version.
-#ifdef DEBUG_DISPATCH
-                std::cout << "Optimizing for new context "
-                          << fun->invocationCount() << ": ";
-                Rf_PrintValue(call.ast);
-                std::cout << given << " vs " << fun->signature().assumptions
-                          << "\n";
-#endif
-                SEXP lhs = CAR(call.ast);
-                SEXP name = R_NilValue;
-                if (TYPEOF(lhs) == SYMSXP)
-                    name = lhs;
-                ctx->closureOptimizer(call.callee, given, name);
-                fun = dispatch(call, table);
-            }
-        }
-    }
-    Assumptions derived =
-        addDynamicAssumptionsForOneTarget(call, fun->signature());
-    call.givenAssumptions = derived;
 
     bool needsEnv = fun->signature().envCreation ==
                     FunctionSignature::Environment::CallerProvided;
@@ -853,55 +802,7 @@ RIR_INLINE SEXP rirCall(CallContext& call, InterpreterInstance* ctx) {
             arglist = createLegacyLazyArgsList(call, ctx);
         PROTECT(arglist);
         SEXP env;
-        if (call.givenAssumptions.includes(Assumption::StaticallyArgmatched)) {
-            auto formals = FORMALS(call.callee);
-            env = Rf_NewEnvironment(formals, arglist, CLOENV(call.callee));
-
-            // Add missing arguments. Stattically argmatched means that still
-            // some missing args might need to be supplied.
-            if (!call.givenAssumptions.includes(
-                    Assumption::NoExplicitlyMissingArgs) ||
-                call.passedArgs != fun->numArgs) {
-                auto f = formals;
-                auto a = arglist;
-                SEXP prevA = nullptr;
-                size_t pos = 0;
-                while (f != R_NilValue) {
-                    if (a == R_NilValue) {
-                        a = CONS_NR(R_MissingArg, R_NilValue);
-                        SET_TAG(a, TAG(f));
-                        SET_MISSING(a, 2);
-                        if (auto dflt = fun->defaultArg(pos)) {
-                            SETCAR(a, createPromise(dflt, env));
-                        }
-                        if (prevA) {
-                            SETCDR(prevA, a);
-                        } else {
-                            assert(arglist == R_NilValue);
-                            SET_FRAME(env, a);
-                        }
-                    } else if (CAR(a) == R_MissingArg) {
-                        if (auto dflt = fun->defaultArg(pos))
-                            SETCAR(a, createPromise(dflt, env));
-                    }
-
-                    f = CDR(f);
-                    prevA = a;
-                    a = CDR(a);
-                    pos++;
-                }
-            }
-
-            // Currently we cannot recreate the original arglist if we
-            // statically reordered arguments. TODO this needs to be fixed
-            // by remembering the original order.
-            if (auto a = ArgsLazyDataContent::check(arglist))
-                a->args = nullptr;
-            else
-                arglist = symbol::delayedArglist;
-        } else {
-            env = closureArgumentAdaptor(call, arglist, R_NilValue);
-        }
+        env = closureArgumentAdaptor(call, arglist, R_NilValue);
         PROTECT(env);
         result = rirCallTrampoline(call, fun, env, arglist, ctx);
         UNPROTECT(2);
@@ -914,12 +815,6 @@ RIR_INLINE SEXP rirCall(CallContext& call, InterpreterInstance* ctx) {
             if (!arglist)
                 arglist = (SEXP)&lazyArgs;
 
-            // Currently we cannot recreate the original arglist if we
-            // statically reordered arguments. TODO this needs to be fixed
-            // by remembering the original order.
-            if (call.givenAssumptions.includes(
-                    Assumption::StaticallyArgmatched))
-                lazyArgs.content.args = nullptr;
             supplyMissingArgs(call, fun);
             result = rirCallTrampoline(call, fun, arglist, ctx);
     }
