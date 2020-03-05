@@ -9,7 +9,7 @@ static std::regex getPassBlacklist() {
     if (filter)
         return std::regex(filter);
     else
-        return std::regex("ElideEnvSpec.*");
+        return std::regex("TypeSpeculation.*");
     return std::regex("");
 }
 
