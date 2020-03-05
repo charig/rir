@@ -8,6 +8,8 @@ static std::regex getPassBlacklist() {
     auto filter = getenv("PIR_PASS_BLACKLIST");
     if (filter)
         return std::regex(filter);
+    else
+        return std::regex("ElideEnvSpec.*");
     return std::regex("");
 }
 
